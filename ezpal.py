@@ -1,8 +1,8 @@
 #!/opt/palapi/bin/python
-"""EZPAL API - Reads live pal data from EZPALExporter mod JSON files."""
+"""EZPAL API - Parses .sav + live mod JSON, serves pal data + suggestions."""
 import os, sys, json, threading
 from datetime import datetime, timezone
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from collections import defaultdict
 
@@ -10,33 +10,43 @@ app = Flask(__name__)
 CORS(app)
 
 # --- Config ---
+SAVE_DIR = os.environ.get("PALWORLD_SAVE_DIR") or "/var/lib/pelican/volumes/0ef8fccb-b40a-4843-b24d-35fdc0e52ba1/Pal/Saved/SaveGames"
 LIVE_DATA_DIR = os.environ.get("EZPAL_DATA_DIR") or "/var/lib/pelican/volumes/0ef8fccb-b40a-4843-b24d-35fdc0e52ba1/ezpal_live/"
 _CACHE_PATH = os.path.join(os.path.dirname(__file__), "paldata.json")
-_CACHE_REFRESH_INTERVAL = 30
+_CACHE_REFRESH_INTERVAL = 60
 _cache = {"last_updated": None, "players": {}, "refreshing": False}
 _cache_lock = threading.Lock()
+
+# -- Optional palworld_save_tools --
+HAS_PAL_SAVE = False
+PALWORLD_TYPE_OVERRIDES = {}
+PALWORLD_SAVE_TYPE_OVERRIDES = {}
+try:
+    from palworld_save_tools.gvas import GvasFile
+    from palworld_save_tools.palsav import decompress_sav_to_gvas
+    from palworld_save_tools.paltypes import PALWORLD_TYPE_HINTS, PALWORLD_CUSTOM_PROPERTIES
+    PALWORLD_TYPE_OVERRIDES = PALWORLD_TYPE_HINTS
+    PALWORLD_SAVE_TYPE_OVERRIDES = PALWORLD_CUSTOM_PROPERTIES
+    HAS_PAL_SAVE = True
+    print("palworld_save_tools loaded", file=sys.stderr)
+except ImportError:
+    print("palworld_save_tools not available — .sav parsing disabled", file=sys.stderr)
 # --- End Config ---
 
 PASSIVE_SCORES = {
-    # Rainbow tier
     "Legend": 100, "Demon God": 95, "Diamond Body": 70, "Vampiric": 70,
     "Remarkable Craftsmanship": 120, "Swift": 70, "Lucky": 85,
     "Eternal Flame": 90, "Siren of the Void": 90, "Invader": 90,
     "Savior": 90, "Lunker": 90, "Eternal Engine": 90, "King of the Waves": 90,
-    # T3 elemental (correct names)
     "Flame Emperor": 90, "Ice Emperor": 90, "Lord of the Sea": 90,
     "Lord of Lightning": 90, "Divine Dragon": 90, "Lord of the Underworld": 90,
     "Earth Emperor": 90, "Celestial Emperor": 90, "Spirit Emperor": 90,
-    # T3 non-elemental
     "Ferocious": 80, "Burly Body": 75, "Artisan": 80, "Serenity": 70,
     "Vanguard": 65, "Stronghold Strategist": 60, "Philanthropist": 55,
     "Infinite Stamina": 70, "Ace Swimmer": 65, "Workaholic": 50,
-    # T2
     "Musclehead": 80, "Serious": 60, "Runner": 55,
-    # T1
     "Work Slave": 50, "Conceited": 35, "Nimble": 30, "Hooligan": 35,
     "Brave": 25, "Nocturnal": 30, "Impatient": 25, "Hard Skin": 25,
-    # T1 elemental
     "Pyromaniac": 25, "Coldblooded": 25, "Hydromaniac": 25, "Capacitor": 25,
     "Blood of the Dragon": 25, "Veil of Darkness": 25, "Power of Gaia": 25,
     "Fragrant Foliage": 25, "Zen Mind": 25,
@@ -46,7 +56,6 @@ NEGATIVE_PASSIVES = {
     "Clumsy", "Coward", "Downtrodden", "Glutton", "Mercy Hit", "Unstable",
     "Sickly", "Shabby", "Easygoing",
 }
-
 PAL_NAMES = {
     "Anubis": "Anubis", "Jormuntide": "Jormuntide", "Jormuntide Ignis": "Jormuntide Ignis",
     "Lyleen": "Lyleen", "Lyleen Noct": "Lyleen Noct", "Frostallion": "Frostallion",
@@ -55,19 +64,302 @@ PAL_NAMES = {
     "Grizzbolt": "Grizzbolt", "Menasting": "Menasting", "Blazamut": "Blazamut",
     "Suzaku": "Suzaku", "Suzaku Aqua": "Suzaku Aqua",
 }
-
 TIER_NAMES = {0: "None", 1: "1-Star", 2: "2-Star", 3: "3-Star", 4: "4-Star"}
 
+# Known Palworld pal internal character IDs (for PlM byte-scan fallback)
+_PAL_IDS = [
+    "Anubis", "Jormuntide", "Lyleen", "Frostallion", "Jetragon",
+    "Shadowbeak", "Astegon", "Grizzbolt", "Menasting", "Blazamut",
+    "Suzaku", "Paladius", "Necromus", "Lovander", "Wixen",
+    "Foxcicle", "Reindrix", "Kitsun", "Mossanda", "Kingpaca",
+    "LilyQueen", "Warsect", "Broncherry", "Beakon", "Helzephyr",
+    "Ragnahawk", "Univolt", "Surfent", "Dinossom", "Cryolinx",
+    "Vaelet", "Hangyu", "Katress", "Relaxaurus", "Chillet",
+    "Grintale", "Sweepa", "Cinnamoth", "Petallia", "Robinquill",
+    "Killamari", "Mammorest", "Dumud", "Verdash", "Elizabee",
+    "Gorirat", "Tombat", "Loupmoon", "Galeclaw", "Melpaca",
+    "Eikthyrdeer", "Nitewing", "Rayhound", "Lamball", "Cattiva",
+    "Chikipi", "Lifmunk", "Foxparks", "Fuack", "Sparkit",
+    "Tanzee", "Rooby", "Pengullet", "Penking", "Jolthog",
+    "Gumoss", "Vixy", "Hoocrates", "Teafant", "Depresso",
+    "Cremis", "Daedream", "Rushoar", "Nox", "Fuddler",
+    "Mau", "Celaray", "Direhowl", "Felbat", "Quivern",
+    "Blazehowl", "Caprity", "Flambelle", "Arsox", "Cawgnito",
+    "Leezpunk", "Woolipop", "Bristla", "Gobfin", "Dazzi",
+    "Sibelyx", "Tocotoco",
+]
 
-# --- Enrichment ---
+
+# ═══════════════════════════════════════════════
+#  SAV PARSING
+# ═══════════════════════════════════════════════
+
+def find_world_dirs():
+    if not os.path.isdir(SAVE_DIR):
+        return []
+    dirs = []
+    for root, dirs_list, files in os.walk(SAVE_DIR):
+        parts = root.replace("\\", "/").split("/")
+        if "backup" in parts:
+            continue
+        if "Level.sav" in files and os.path.isdir(os.path.join(root, "Players")):
+            dirs.append(root)
+    return dirs
+
+
+def read_sav_gvas(raw):
+    magic = raw[8:11]
+    if magic == b"PlM":
+        return raw[20:], 0
+    elif magic == b"PlZ":
+        return decompress_sav_to_gvas(raw)
+    else:
+        raise Exception(f"Unknown save magic: {magic!r}")
+
+
+def scan_plm_pals(gvas_bytes):
+    found = set()
+    for pal_id in _PAL_IDS:
+        if pal_id.encode() in gvas_bytes:
+            found.add(pal_id)
+    return sorted(found)
+
+
+def _parse_pal_raw(raw):
+    """Extract every available field from a pal's RawData dict."""
+    try:
+        if not isinstance(raw, dict):
+            return None
+        cid = raw.get("character_id", "Unknown")
+        pal = {
+            # Identity
+            "character_id":  cid,
+            "display_name":  PAL_NAMES.get(cid, cid.replace("_", " ").title()),
+            "name":          cid,
+            "nickname":      raw.get("nickname") or "",
+            "gender":        raw.get("gender", ""),
+            # Stats
+            "level":         int(raw.get("level", 1)),
+            "rank":          int(raw.get("rank", 0)),
+            "rank_up_count": int(raw.get("rank_up_count", 0)),
+            # Talents / IVs
+            "talent_hp":     int(raw.get("talent_hp", raw.get("talent_hp", 0))),
+            "talent_attack": int(raw.get("talent_attack", raw.get("talent_attack", 0))),
+            "talent_defense": int(raw.get("talent_defense", raw.get("talent_defense", 0))),
+            # Soul stats
+            "soul_hp":       int(raw.get("soul_hp", 0)),
+            "soul_attack":   int(raw.get("soul_attack", 0)),
+            "soul_defense":  int(raw.get("soul_defense", 0)),
+            # Flags
+            "is_boss":       bool(raw.get("is_boss", False)),
+            "is_alpha":      bool(raw.get("is_boss", False)),
+            "is_tower":      bool(raw.get("is_tower", False)),
+            "is_rare":       bool(raw.get("is_rare", False)),
+            "is_lucky":      bool(raw.get("is_lucky", False)),
+            "is_paldeck":    bool(raw.get("is_paldeck", False)),
+            # Battle stats
+            "hp":            int(raw.get("hp", 0)),
+            "max_hp":        int(raw.get("max_hp", 0)),
+            "attack":        float(raw.get("attack", 0)),
+            "defense":       float(raw.get("defense", 0)),
+            "craft_speed":   float(raw.get("craft_speed", 1.0)),
+            "move_speed":    float(raw.get("move_speed", 1.0)),
+            "support":       float(raw.get("support", 0)),
+            # Food / sanity
+            "food_amount":   int(raw.get("food_amount", 0)),
+            "food_remaining": float(raw.get("food_remaining", 0)),
+            "sanity":        float(raw.get("sanity", 1.0)),
+            # Skills
+            "passive_skills": [],
+            "active_skills":  [],
+            "learned_skills": [],
+            "partner_skill":  raw.get("partner_skill", ""),
+            # Ownership
+            "player_uid":    "",
+            "slot":          int(raw.get("slot", 0)),
+            "container_id":  {},
+            # Breeding
+            "breeding_count": int(raw.get("breeding_count", 0)),
+            "prefer_work":    int(raw.get("prefer_work", 0)),
+            "stored_item":    {},
+            "pal_gear":       {},
+            "elements":       [],
+            "work_suitability": [],
+            "taming":         int(raw.get("taming", 0)),
+        }
+
+        # ── Passives ──────────────────────────────────────
+        if "passive_skills" in raw:
+            for p in raw["passive_skills"]:
+                if isinstance(p, str):
+                    pal["passive_skills"].append(p.replace("_", " ").title())
+        # Handle both naming conventions
+        if "passive_skill_list" in raw:
+            for p in raw.get("passive_skill_list", []):
+                if isinstance(p, dict):
+                    pal["passive_skills"].append(str(p.get("passive_id", p.get("id", ""))))
+                elif isinstance(p, str):
+                    pal["passive_skills"].append(p.replace("_", " ").title())
+
+        # ── Active skills ─────────────────────────────────
+        if "active_skills" in raw:
+            for s in raw["active_skills"]:
+                if isinstance(s, dict):
+                    sid = s.get("skill_id", s.get("id", ""))
+                    pal["active_skills"].append(sid)
+                elif isinstance(s, str):
+                    pal["active_skills"].append(s)
+
+        # ── Learned skills ────────────────────────────────
+        if "learned_skills" in raw:
+            for s in raw["learned_skills"]:
+                if isinstance(s, dict):
+                    sid = s.get("skill_id", s.get("id", ""))
+                    pal["learned_skills"].append(sid)
+                elif isinstance(s, str):
+                    pal["learned_skills"].append(s)
+
+        # ── Elements ──────────────────────────────────────
+        if "elements" in raw:
+            for e in raw["elements"]:
+                if isinstance(e, dict):
+                    pal["elements"].append(e.get("element_type", e.get("type", "")))
+                elif isinstance(e, str):
+                    pal["elements"].append(e)
+
+        # ── Owner ─────────────────────────────────────────
+        uid = raw.get("player_uid")
+        if isinstance(uid, bytes):
+            pal["player_uid"] = uid.hex()
+        elif uid:
+            pal["player_uid"] = str(uid)
+
+        # ── Scores ────────────────────────────────────────
+        pal["passive_score"] = score_passives(pal["passive_skills"])
+        pal["overall_score"] = calc_overall_score(pal)
+        return pal
+    except Exception as e:
+        return None
+
+
+def _extract_pals(sd, data):
+    for key, val in sd.items():
+        if isinstance(val, dict):
+            for sub_key in ("array", "value"):
+                if sub_key in val and isinstance(val[sub_key], list):
+                    for item in val[sub_key]:
+                        if isinstance(item, dict) and "RawData" in item:
+                            pal = _parse_pal_raw(item["RawData"])
+                            if pal:
+                                data["pals"].append(pal)
+
+
+def _extract_from_container(props, data):
+    for key in ("container", "pal_container", "PalContainer", "CharacterContainer",
+                "OtomoCharacterContainer", "PalStorage"):
+        if key in props:
+            val = props[key].value
+            if isinstance(val, dict):
+                for pk, pv in val.items():
+                    _traverse_for_pals(pv, data)
+
+
+def _traverse_for_pals(obj, data):
+    if isinstance(obj, dict):
+        if "RawData" in obj:
+            pal = _parse_pal_raw(obj["RawData"])
+            if pal:
+                data["pals"].append(pal)
+        for v in obj.values():
+            _traverse_for_pals(v, data)
+    elif isinstance(obj, list):
+        for item in obj:
+            _traverse_for_pals(item, data)
+
+
+def _load_player_nickname(steam_id):
+    nick_path = os.path.join(os.path.dirname(__file__), "players.json")
+    try:
+        with open(nick_path) as f:
+            nicknames = json.load(f)
+        return nicknames.get(steam_id, "")
+    except Exception:
+        return ""
+
+
+def parse_player_sav(path):
+    filename = os.path.basename(path)
+    default_steam_id = filename.replace(".sav", "")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        gvas_bytes, _ = read_sav_gvas(raw)
+        gvas_file = GvasFile.read(gvas_bytes, PALWORLD_TYPE_OVERRIDES, PALWORLD_SAVE_TYPE_OVERRIDES)
+        data = {"steam_id": default_steam_id, "name": "", "nickname": "", "pals": [], "party": []}
+        props = gvas_file.properties
+
+        # ── Player identity ──
+        if "group_0" in props:
+            g0 = props["group_0"].value
+            if "group_1" in props:
+                g1 = props["group_1"].value
+                if "player_uid" in g1:
+                    uid = g1["player_uid"].value
+                    if isinstance(uid, bytes):
+                        data["steam_id"] = uid.hex()
+                    else:
+                        data["steam_id"] = str(uid)
+                if "player_name" in g1:
+                    data["name"] = str(g1["player_name"].value)
+
+        # ── Player nickname from manual lookup ──
+        if not data.get("name"):
+            data["name"] = _load_player_nickname(data["steam_id"])
+
+        # ── Extract all pals ──
+        if "SaveData" in props:
+            sd = props["SaveData"].value
+            _extract_pals(sd, data)
+        _extract_from_container(props, data)
+
+        # Also try containers inside group_0
+        if "group_0" in props:
+            g0 = props["group_0"].value
+            if isinstance(g0, dict):
+                for v in g0.values():
+                    _traverse_for_pals(v, data)
+
+        # ── Sort pal slots ──
+        data["pals"].sort(key=lambda p: p.get("slot", 0))
+        return data
+
+    except Exception as e:
+        # PlM or corrupt — fall back to byte scanning
+        nickname = _load_player_nickname(default_steam_id)
+        pals = scan_plm_pals(open(path, "rb").read())
+        return {
+            "steam_id": default_steam_id,
+            "name": nickname or default_steam_id,
+            "nickname": nickname,
+            "pals": [{"character_id": pid, "display_name": PAL_NAMES.get(pid, pid),
+                       "name": pid, "level": 1, "rank": 0,
+                       "passive_skills": [], "passive_score": 0, "overall_score": 2}
+                      for pid in pals],
+            "party": [],
+            "sav_parse_error": str(e),
+        }
+
+
+# ═══════════════════════════════════════════════
+#  ENRICHMENT
+# ═══════════════════════════════════════════════
 
 def score_passives(positives, negatives=None):
-    """Score a pal's passives. Accepts positive and negative lists separately."""
     score = 0
     for p in (positives or []):
         score += PASSIVE_SCORES.get(p, 0)
     for p in (negatives or []):
-        score -= 30  # any negative passive costs 30 pts
+        score -= 30
     return score
 
 
@@ -75,10 +367,9 @@ def calc_overall_score(pal):
     score = pal.get("passive_score", 0)
     score += pal.get("level", 1) * 2
     score += pal.get("rank", 0) * 20
-    # Accept both field name conventions: talent_* (old) and *_iv (mod v2)
-    hp  = pal.get("talent_hp",      pal.get("hp_iv",  0))
-    atk = pal.get("talent_attack",  pal.get("atk_iv", 0))
-    dfn = pal.get("talent_defense", pal.get("def_iv", 0))
+    hp   = pal.get("talent_hp", pal.get("hp_iv", 0))
+    atk  = pal.get("talent_attack", pal.get("atk_iv", 0))
+    dfn  = pal.get("talent_defense", pal.get("def_iv", 0))
     score += (hp + atk + dfn) / 3
     if pal.get("is_boss") or pal.get("is_alpha"):
         score += 15
@@ -86,26 +377,36 @@ def calc_overall_score(pal):
 
 
 def enrich_pal(pal):
-    # ── Normalise species field (mod writes "species", old code used "character_id")
     species = pal.get("species") or pal.get("character_id") or "Unknown"
     pal["name"]         = species
     pal["display_name"] = PAL_NAMES.get(species, species.replace("_", " ").title())
 
-    # ── Normalise passive fields
-    # Mod writes separate positives/negatives; old format used "passives"
-    positives = pal.get("passives") or pal.get("passives") or []
+    # Normalise passives
+    positives = pal.get("passives") or pal.get("passive_skills") or []
     negatives = pal.get("neg_passives") or []
-    # Old format: everything in one list, negatives identified by name
     if not negatives and positives:
         negatives = [p for p in positives if p in NEGATIVE_PASSIVES]
         positives = [p for p in positives if p not in NEGATIVE_PASSIVES]
+    # Normalise .sav flat passive_skills into separate lists
+    if positives and not negatives:
+        negatives = [p for p in positives if p in NEGATIVE_PASSIVES]
+        positives = [p for p in positives if p not in NEGATIVE_PASSIVES]
+
     pal["passives"]     = positives
     pal["neg_passives"] = negatives
+    pal["passive_skills"] = positives + negatives
 
-    # ── Normalise IV fields
-    pal["talent_hp"]       = pal.get("talent_hp",      pal.get("hp_iv",  0))
-    pal["talent_attack"]   = pal.get("talent_attack",  pal.get("atk_iv", 0))
-    pal["talent_defense"]  = pal.get("talent_defense", pal.get("def_iv", 0))
+    # Normalise IVs
+    pal["talent_hp"]      = pal.get("talent_hp", pal.get("hp_iv", 0))
+    pal["talent_attack"]  = pal.get("talent_attack", pal.get("atk_iv", 0))
+    pal["talent_defense"] = pal.get("talent_defense", pal.get("def_iv", 0))
+
+    # Aliases for dashboard
+    pal["hp_iv"]  = pal["talent_hp"]
+    pal["atk_iv"] = pal["talent_attack"]
+    pal["def_iv"] = pal["talent_defense"]
+    pal["is_alpha"] = pal.get("is_alpha", pal.get("is_boss", False))
+    pal["is_boss"]  = pal.get("is_boss", pal.get("is_alpha", False))
 
     pal["passive_score"] = score_passives(positives, negatives)
     pal["overall_score"] = calc_overall_score(pal)
@@ -113,17 +414,97 @@ def enrich_pal(pal):
 
 
 def enrich_player(player):
-    # Normalise player identity fields (mod writes player_id/player_name)
     if not player.get("steam_id"):
         player["steam_id"] = player.get("player_id", "unknown")
     if not player.get("name"):
-        player["name"] = player.get("player_name", player.get("nickname", player["steam_id"]))
+        player["name"] = player.get("player_name") or player.get("nickname") or player["steam_id"]
     if "pals" in player:
         player["pals"] = [enrich_pal(p) for p in player.get("pals", []) if p]
     return player
 
 
-# --- Suggestion Engine ---
+# ═══════════════════════════════════════════════
+#  MERGE: .sav base + mod live overlay
+# ═══════════════════════════════════════════════
+
+def _overlay_mod_pals(sav_player, mod_player):
+    """Overlay mod's party-pal passives onto the .sav player's pal list.
+    Mod data has better passive resolution for live party pals."""
+    mod_pals = {_pal_key(p): p for p in mod_player.get("pals", [])}
+    for pal in sav_player.get("pals", []):
+        key = _pal_key(pal)
+        mp = mod_pals.get(key)
+        if mp and mp.get("passives"):
+            # Mod has better passive data — overlay
+            pal["passives"]     = mp.get("passives", [])
+            pal["neg_passives"] = mp.get("neg_passives", [])
+            pal["passive_skills"] = pal["passives"] + pal["neg_passives"]
+            pal["passive_score"] = score_passives(pal["passives"], pal["neg_passives"])
+            pal["overall_score"] = calc_overall_score(pal)
+    return sav_player
+
+
+def _pal_key(pal):
+    """Unique key for matching pals between .sav and mod data."""
+    cid = pal.get("character_id") or pal.get("species") or ""
+    lv  = pal.get("level", 0)
+    rk  = pal.get("rank", 0)
+    return f"{cid}|L{lv}|R{rk}"
+
+
+# ═══════════════════════════════════════════════
+#  MOD JSON READING
+# ═══════════════════════════════════════════════
+
+def _read_mod_json():
+    """Read and enrich the mod's all_players.json. Returns {sid: player}."""
+    combined_path = os.path.join(LIVE_DATA_DIR, "all_players.json")
+    if not os.path.isfile(combined_path):
+        return {}
+    with open(combined_path, "r") as f:
+        raw = json.load(f)
+    players_list = raw.get("players", raw) if isinstance(raw, dict) else raw
+    if isinstance(players_list, dict):
+        players_list = list(players_list.values())
+    result = {}
+    for player in players_list:
+        sid = player.get("steam_id") or player.get("player_id") or ""
+        if not sid:
+            continue
+        result[sid] = enrich_player(player)
+    return result
+
+
+# ═══════════════════════════════════════════════
+#  SAV READING
+# ═══════════════════════════════════════════════
+
+def _read_sav_players():
+    """Parse all .sav files and return {sid: player}."""
+    if not HAS_PAL_SAVE:
+        return {}
+    result = {}
+    world_dirs = find_world_dirs()
+    for wd in world_dirs:
+        player_dir = os.path.join(wd, "Players")
+        if not os.path.isdir(player_dir):
+            continue
+        for f in os.listdir(player_dir):
+            if not f.endswith(".sav"):
+                continue
+            path = os.path.join(player_dir, f)
+            try:
+                data = parse_player_sav(path)
+                sid = data.get("steam_id", f.replace(".sav", ""))
+                result[sid] = enrich_player(data)
+            except Exception as e:
+                print(f"Failed to parse {f}: {e}", file=sys.stderr)
+    return result
+
+
+# ═══════════════════════════════════════════════
+#  SUGGESTION ENGINE
+# ═══════════════════════════════════════════════
 
 def generate_suggestions(pals):
     by_species = defaultdict(list)
@@ -147,13 +528,10 @@ def generate_suggestions(pals):
             best = group[0]
             keepers.append(best)
             counts["kept"] = 1
-
             for pal in group[1:]:
                 fodder.append(pal)
                 counts["fodder"] += 1
-
             for pal in fodder:
-                condense_needed = min(4 - best.get("rank", 0), pal.get("rank", 0) + 1)
                 suggestions.append({
                     "species": species,
                     "condense_into": {
@@ -204,7 +582,9 @@ def _condense_reason(best, fodder):
     return "; ".join(reasons)
 
 
-# --- Cache Layer ---
+# ═══════════════════════════════════════════════
+#  CACHE LAYER
+# ═══════════════════════════════════════════════
 
 def _load_cache():
     global _cache
@@ -222,10 +602,7 @@ def _load_cache():
 
 def _save_cache():
     with _cache_lock:
-        data = {
-            "last_updated": _cache["last_updated"],
-            "players": _cache["players"],
-        }
+        data = {"last_updated": _cache["last_updated"], "players": _cache["players"]}
     tmp = _CACHE_PATH + ".tmp"
     try:
         with open(tmp, "w") as f:
@@ -242,33 +619,37 @@ def _rebuild_cache():
         _cache["refreshing"] = True
 
     try:
-        combined_path = os.path.join(LIVE_DATA_DIR, "all_players.json")
-        if not os.path.isfile(combined_path):
-            print("all_players.json not found yet", file=sys.stderr)
+        merged = {}
+        sources = []
+
+        # Phase 1: .sav (complete data, all boxes)
+        sav = _read_sav_players()
+        if sav:
+            sources.append(f"sav({len(sav)})")
+            merged.update(sav)
+
+        # Phase 2: mod JSON (live party data, better passives)
+        mod = _read_mod_json()
+        if mod:
+            sources.append(f"mod({len(mod)})")
+            for sid, mplayer in mod.items():
+                if sid in merged:
+                    merged[sid] = _overlay_mod_pals(merged[sid], mplayer)
+                    merged[sid]["name"]  = mplayer.get("name", merged[sid].get("name", sid))
+                    merged[sid]["last_updated"] = datetime.now(timezone.utc).isoformat()
+                else:
+                    merged[sid] = mplayer
+
+        if not merged:
+            print("No data from any source", file=sys.stderr)
             return
 
-        with open(combined_path, "r") as f:
-            raw = json.load(f)
-
-        players_list = raw.get("players", raw) if isinstance(raw, dict) else raw
-        if isinstance(players_list, dict):
-            players_list = list(players_list.values())
-
-        new_players = {}
-        for player in players_list:
-            # Accept both "steam_id" (old) and "player_id" (mod v2)
-            sid = player.get("steam_id") or player.get("player_id") or ""
-            if not sid:
-                print("WARNING: player entry has no steam_id or player_id, skipping", file=sys.stderr)
-                continue
-            enriched = enrich_player(player)
-            new_players[sid] = enriched
-
         with _cache_lock:
-            _cache["players"] = new_players
+            _cache["players"] = merged
             _cache["last_updated"] = datetime.now(timezone.utc).isoformat()
         _save_cache()
-        print(f"Cache rebuilt: {len(new_players)} players from JSON", file=sys.stderr)
+        total_pals = sum(len(p.get("pals", [])) for p in merged.values())
+        print(f"Cache rebuilt: {len(merged)} players, {total_pals} pals from {' + '.join(sources)}", file=sys.stderr)
     except Exception as e:
         print(f"Cache rebuild failed: {e}", file=sys.stderr)
     finally:
@@ -298,23 +679,25 @@ def _cache_age_seconds():
         return None
 
 
-# --- API Routes ---
+# ═══════════════════════════════════════════════
+#  API ROUTES
+# ═══════════════════════════════════════════════
 
 @app.route("/api/players")
 def list_players():
     age = _cache_age_seconds()
     if age is None:
-        return jsonify({"players": [], "message": "No cache data. Trigger /api/refresh first."})
-
+        return jsonify({"players": [], "message": "No data. Trigger /api/refresh first."})
     with _cache_lock:
         cached_players = dict(_cache["players"])
     players = []
     for sid, data in cached_players.items():
         players.append({
             "steam_id":   data.get("steam_id", sid),
-            "name":       data.get("name", data.get("player_name", sid)),
+            "name":       data.get("name", sid),
+            "player_name": data.get("player_name", data.get("name", sid)),
             "pal_count":  len(data.get("pals", [])),
-            "last_updated": data.get("last_updated"),
+            "nickname":   data.get("nickname", ""),
         })
     return jsonify({"players": players, "cache_age_seconds": age})
 
@@ -343,7 +726,6 @@ def search_pals():
     query = request.args.get("q", "").lower()
     limit = request.args.get("limit", 50, type=int)
     min_passive_score = request.args.get("min_score", 0, type=int)
-
     results = []
     for data in _get_all_cached_players():
         for pal in data.get("pals", []):
@@ -354,18 +736,8 @@ def search_pals():
                 continue
             pal["owner_steam_id"] = data.get("steam_id", "")
             results.append(pal)
-
     results.sort(key=lambda x: x.get("overall_score", 0), reverse=True)
     return jsonify({"pals": results[:limit], "total": len(results), "query": query})
-
-
-@app.route("/api/refresh")
-def refresh_cache():
-    with _cache_lock:
-        if _cache["refreshing"]:
-            return jsonify({"status": "already_refreshing"})
-    threading.Thread(target=_rebuild_cache, daemon=True).start()
-    return jsonify({"status": "started"})
 
 
 @app.route("/api/cache/status")
@@ -379,15 +751,32 @@ def cache_status():
         "cache_age_seconds": age,
         "player_count": player_count,
         "refreshing": refreshing,
+        "sav_available": HAS_PAL_SAVE,
+        "live_data_dir": LIVE_DATA_DIR,
+        "save_dir": SAVE_DIR,
     })
+
+
+@app.route("/api/refresh")
+def refresh_cache():
+    with _cache_lock:
+        if _cache["refreshing"]:
+            return jsonify({"status": "already_refreshing"})
+    threading.Thread(target=_rebuild_cache, daemon=True).start()
+    return jsonify({"status": "started"})
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({
+        "status": "ok",
+        "sav_parsing": HAS_PAL_SAVE,
+    })
 
 
-# --- Background Refresh ---
+# ═══════════════════════════════════════════════
+#  BACKGROUND REFRESH
+# ═══════════════════════════════════════════════
 
 def _start_background_refresh():
     while True:
@@ -410,9 +799,7 @@ if __name__ == "__main__":
         threading.Thread(target=_rebuild_cache, daemon=True).start()
     else:
         print(f"Cache loaded ({age:.0f}s old, {len(_cache['players'])} players)", file=sys.stderr)
-
     threading.Thread(target=_start_background_refresh, daemon=True).start()
-
     port = int(os.environ.get("API_PORT", 8213))
-    print(f"EZPAL API on port {port}", file=sys.stderr)
+    print(f"EZPAL API on port {port} (sav={HAS_PAL_SAVE})", file=sys.stderr)
     app.run(host="0.0.0.0", port=port, debug=False)
