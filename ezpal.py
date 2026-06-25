@@ -173,14 +173,34 @@ def find_world_dirs():
     return dirs
 
 
-def read_sav_gvas(raw):
+def read_sav_data(raw):
+    """Extract raw GVAS bytes from any Palworld save format (PlZ, PlM, CNK+PlZ, CNK+PlM)."""
+    offset = 0
     magic = raw[8:11]
-    if magic == b"PlM":
-        return raw[20:], 0
-    elif magic == b"PlZ":
-        return decompress_sav_to_gvas(raw)
+
+    # CNK prefix: a second 12-byte header wraps the real format
+    if magic == b"CNK":
+        offset = 24
+        magic = raw[20:23]
     else:
-        raise Exception(f"Unknown save magic: {magic!r}")
+        offset = 12
+
+    if magic == b"PlZ":
+        # Compressed — let palworld_save_tools handle decompression
+        return decompress_sav_to_gvas(raw)
+
+    elif magic == b"PlM":
+        # Uncompressed — GVAS data starts at offset
+        gvas_bytes = raw[offset:]
+        # Some PlM saves have a secondary header at the start of GVAS data;
+        # try skipping a UE4 package header if present (sometimes another 4 bytes)
+        return gvas_bytes, 0
+
+    else:
+        # Maybe data already starts at 0 (raw GVAS with no container)
+        if raw[:4] == b"GVAS":
+            return raw, 0
+        raise Exception(f"Unknown save magic: {magic!r} at header offset 8-10")
 
 
 def scan_plm_pals(gvas_bytes):
@@ -390,7 +410,7 @@ def parse_player_sav(path):
     try:
         with open(path, "rb") as f:
             raw = f.read()
-        gvas_bytes, _ = read_sav_gvas(raw)
+        gvas_bytes, _ = read_sav_data(raw)
         gvas_file = GvasFile.read(gvas_bytes, PALWORLD_TYPE_OVERRIDES, PALWORLD_SAVE_TYPE_OVERRIDES)
         data = {"steam_id": default_steam_id, "name": "", "nickname": "",
                 "pals": [], "party": [], "container_stats": {}}
@@ -913,7 +933,7 @@ def debug_explore():
             try:
                 with open(path, "rb") as f:
                     raw = f.read()
-                gvas_bytes, _ = read_sav_gvas(raw)
+                gvas_bytes, _ = read_sav_data(raw)
                 gvas_file = GvasFile.read(gvas_bytes, PALWORLD_TYPE_OVERRIDES, PALWORLD_SAVE_TYPE_OVERRIDES)
 
                 def summarize(obj, depth=0):
