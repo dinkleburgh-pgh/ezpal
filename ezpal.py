@@ -125,13 +125,14 @@ def scan_plm_pals(gvas_bytes):
     return sorted(found)
 
 
-def _parse_pal_raw(raw):
+def _parse_pal_raw(raw, source="unknown"):
     """Extract every available field from a pal's RawData dict."""
     try:
         if not isinstance(raw, dict):
             return None
         cid = raw.get("character_id", "Unknown")
         pal = {
+            "_source": source,
             # Identity
             "character_id":  cid,
             "display_name":  PAL_NAMES.get(cid, cid.replace("_", " ").title()),
@@ -242,39 +243,67 @@ def _parse_pal_raw(raw):
         return None
 
 
-def _extract_pals(sd, data):
-    for key, val in sd.items():
-        if isinstance(val, dict):
-            for sub_key in ("array", "value"):
-                if sub_key in val and isinstance(val[sub_key], list):
-                    for item in val[sub_key]:
-                        if isinstance(item, dict) and "RawData" in item:
-                            pal = _parse_pal_raw(item["RawData"])
-                            if pal:
-                                data["pals"].append(pal)
+_MAX_TRAVERSE_DEPTH = 50
+_seen_pal_keys = set()
+
+def _pal_dedup_key(raw):
+    """Generate a stable dedup key from a pal's RawData dict."""
+    cid = raw.get("character_id", "")
+    slot = raw.get("slot", 0)
+    uid = raw.get("player_uid", b"")
+    if isinstance(uid, bytes):
+        uid = uid.hex()[:16]
+    lv = raw.get("level", 0)
+    rk = raw.get("rank", 0)
+    return f"{cid}|{slot}|{uid}|L{lv}|R{rk}"
 
 
-def _extract_from_container(props, data):
-    for key in ("container", "pal_container", "PalContainer", "CharacterContainer",
-                "OtomoCharacterContainer", "PalStorage"):
+def _extract_all_containers(props, data):
+    """Search every property that could hold pal containers, covering all known
+    Palworld save-version naming conventions."""
+    container_keys = [
+        "container", "pal_container", "PalContainer", "CharacterContainer",
+        "OtomoCharacterContainer", "PalStorage", "PalBox",
+        "IndividualCharacterContainer", "PalCharacterContainer",
+        "WorkerContainer", "BaseCampContainer",
+        "individual_character_handle_ids", "character_handle_ids",
+    ]
+    for key in container_keys:
         if key in props:
             val = props[key].value
-            if isinstance(val, dict):
-                for pk, pv in val.items():
-                    _traverse_for_pals(pv, data)
+            _traverse_for_pals(val, data, key, 1)
+
+    # Also walk every top-level property — some patches use unique names
+    for pkey, pval in props.items():
+        if pkey not in container_keys and pkey not in ("SaveData", "group_0", "group_1"):
+            _traverse_for_pals(pval.value, data, f"prop:{pkey}", 1)
 
 
-def _traverse_for_pals(obj, data):
+def _traverse_for_pals(obj, data, source="unknown", depth=0):
+    """Recursively search for RawData dicts. Depth-limited, deduped, source-tracked."""
+    if depth > _MAX_TRAVERSE_DEPTH:
+        return
     if isinstance(obj, dict):
         if "RawData" in obj:
-            pal = _parse_pal_raw(obj["RawData"])
-            if pal:
-                data["pals"].append(pal)
+            raw = obj["RawData"]
+            if isinstance(raw, dict):
+                dk = _pal_dedup_key(raw)
+                if dk not in _seen_pal_keys:
+                    _seen_pal_keys.add(dk)
+                    pal = _parse_pal_raw(raw, source)
+                    if pal:
+                        data["pals"].append(pal)
         for v in obj.values():
-            _traverse_for_pals(v, data)
+            _traverse_for_pals(v, data, source, depth + 1)
     elif isinstance(obj, list):
         for item in obj:
-            _traverse_for_pals(item, data)
+            _traverse_for_pals(item, data, source, depth + 1)
+
+
+def _extract_save_data_pals(sd, data):
+    """Extract pals from the SaveData property map.
+    SaveData can have multiple deep structures; we brute-force traverse everything."""
+    _traverse_for_pals(sd, data, "SaveData", 1)
 
 
 def _load_player_nickname(steam_id):
@@ -290,12 +319,15 @@ def _load_player_nickname(steam_id):
 def parse_player_sav(path):
     filename = os.path.basename(path)
     default_steam_id = filename.replace(".sav", "")
+    global _seen_pal_keys
+    _seen_pal_keys = set()
     try:
         with open(path, "rb") as f:
             raw = f.read()
         gvas_bytes, _ = read_sav_gvas(raw)
         gvas_file = GvasFile.read(gvas_bytes, PALWORLD_TYPE_OVERRIDES, PALWORLD_SAVE_TYPE_OVERRIDES)
-        data = {"steam_id": default_steam_id, "name": "", "nickname": "", "pals": [], "party": []}
+        data = {"steam_id": default_steam_id, "name": "", "nickname": "",
+                "pals": [], "party": [], "container_stats": {}}
         props = gvas_file.properties
 
         # ── Player identity ──
@@ -312,29 +344,41 @@ def parse_player_sav(path):
                 if "player_name" in g1:
                     data["name"] = str(g1["player_name"].value)
 
-        # ── Player nickname from manual lookup ──
         if not data.get("name"):
             data["name"] = _load_player_nickname(data["steam_id"])
 
-        # ── Extract all pals ──
+        # ── Phase 1: SaveData ──
         if "SaveData" in props:
             sd = props["SaveData"].value
-            _extract_pals(sd, data)
-        _extract_from_container(props, data)
+            _extract_save_data_pals(sd, data)
 
-        # Also try containers inside group_0
+        # ── Phase 2: Known container properties ──
+        _extract_all_containers(props, data)
+
+        # ── Phase 3: group_0 deep search ──
         if "group_0" in props:
             g0 = props["group_0"].value
             if isinstance(g0, dict):
                 for v in g0.values():
-                    _traverse_for_pals(v, data)
+                    _traverse_for_pals(v, data, "group_0", 1)
 
-        # ── Sort pal slots ──
-        data["pals"].sort(key=lambda p: p.get("slot", 0))
+        # ── Compute container stats ──
+        container_counts = {}
+        for pal in data["pals"]:
+            src = pal.get("_source", "unknown")
+            container_counts[src] = container_counts.get(src, 0) + 1
+        data["container_stats"] = container_counts
+        # Separate party vs box
+        data["party"] = [p for p in data["pals"]
+                         if p.get("_source", "").startswith("OtomoCharacterContainer")
+                         or p.get("slot", 99) < 6]
+        data["pals"].sort(key=lambda p: (p.get("_source", ""), p.get("slot", 0)))
+        data["pal_count"] = len(data["pals"])
+        data["party_count"] = len(data["party"])
+        data["box_count"] = max(0, data["pal_count"] - data["party_count"])
         return data
 
     except Exception as e:
-        # PlM or corrupt — fall back to byte scanning
         nickname = _load_player_nickname(default_steam_id)
         pals = scan_plm_pals(open(path, "rb").read())
         return {
@@ -343,9 +387,14 @@ def parse_player_sav(path):
             "nickname": nickname,
             "pals": [{"character_id": pid, "display_name": PAL_NAMES.get(pid, pid),
                        "name": pid, "level": 1, "rank": 0,
-                       "passive_skills": [], "passive_score": 0, "overall_score": 2}
+                       "passive_skills": [], "passive_score": 0, "overall_score": 2,
+                       "_source": "plm_scan"}
                       for pid in pals],
             "party": [],
+            "container_stats": {"plm_scan": len(pals)},
+            "pal_count": len(pals),
+            "party_count": 0,
+            "box_count": len(pals),
             "sav_parse_error": str(e),
         }
 
@@ -380,6 +429,12 @@ def enrich_pal(pal):
     species = pal.get("species") or pal.get("character_id") or "Unknown"
     pal["name"]         = species
     pal["display_name"] = PAL_NAMES.get(species, species.replace("_", " ").title())
+    if "_source" not in pal:
+        # Mod data or .sav data without explicit source: mark from passives/neg_passives presence
+        if "neg_passives" in pal or "passives" in pal:
+            pal["_source"] = "live_mod"
+        else:
+            pal["_source"] = "enriched"
 
     # Normalise passives
     positives = pal.get("passives") or pal.get("passive_skills") or []
@@ -420,6 +475,21 @@ def enrich_player(player):
         player["name"] = player.get("player_name") or player.get("nickname") or player["steam_id"]
     if "pals" in player:
         player["pals"] = [enrich_pal(p) for p in player.get("pals", []) if p]
+    # Compute box/party breakdown
+    pals = player.get("pals", [])
+    player["pal_count"] = len(pals)
+    player["party"] = [p for p in pals
+                       if p.get("_source", "") in ("live_mod", "OtomoCharacterContainer")
+                       or p.get("_source", "").startswith("OtomoCharacterContainer")
+                       or p.get("slot", 99) < 6]
+    player["party_count"] = len(player["party"])
+    player["box_count"] = max(0, player["pal_count"] - player["party_count"])
+    # Container stats from _source
+    cstats = {}
+    for p in pals:
+        src = p.get("_source", "unknown")
+        cstats[src] = cstats.get(src, 0) + 1
+    player["container_stats"] = cstats
     return player
 
 
@@ -696,7 +766,9 @@ def list_players():
             "steam_id":   data.get("steam_id", sid),
             "name":       data.get("name", sid),
             "player_name": data.get("player_name", data.get("name", sid)),
-            "pal_count":  len(data.get("pals", [])),
+            "pal_count":  data.get("pal_count", len(data.get("pals", []))),
+            "party_count": data.get("party_count", 0),
+            "box_count":   data.get("box_count", 0),
             "nickname":   data.get("nickname", ""),
         })
     return jsonify({"players": players, "cache_age_seconds": age})
@@ -755,6 +827,48 @@ def cache_status():
         "live_data_dir": LIVE_DATA_DIR,
         "save_dir": SAVE_DIR,
     })
+
+
+@app.route("/_debug/explore")
+def debug_explore():
+    """Dump the GVAS property tree of a player's .sav file for debugging."""
+    if not HAS_PAL_SAVE:
+        return jsonify({"error": "palworld_save_tools not available"})
+    steam_id = request.args.get("steam_id", "")
+    if not steam_id:
+        return jsonify({"error": "?steam_id=<player_steam_id>"})
+
+    world_dirs = find_world_dirs()
+    for wd in world_dirs:
+        path = os.path.join(wd, "Players", f"{steam_id}.sav")
+        if not os.path.isfile(path):
+            path = os.path.join(wd, "Players", f"{steam_id.lower()}.sav")
+        if os.path.isfile(path):
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read()
+                gvas_bytes, _ = read_sav_gvas(raw)
+                gvas_file = GvasFile.read(gvas_bytes, PALWORLD_TYPE_OVERRIDES, PALWORLD_SAVE_TYPE_OVERRIDES)
+
+                def summarize(obj, depth=0):
+                    if depth > 5:
+                        return "..."
+                    if isinstance(obj, dict):
+                        keys = list(obj.keys())[:30]
+                        return {k: type(v).__name__ if not isinstance(v, (dict, list)) else summarize(v, depth + 1) for k, v in list(obj.items())[:15]}
+                    if isinstance(obj, list):
+                        if not obj:
+                            return "[]"
+                        return f"[{len(obj)} items, first: {summarize(obj[0], depth + 1)}]"
+                    if hasattr(obj, 'value'):
+                        return f"<{type(obj).__name__}>"
+                    return str(obj)[:100]
+
+                tree = {k: summarize(v.value) if hasattr(v, 'value') else type(v).__name__ for k, v in gvas_file.properties.items()}
+                return jsonify({"steam_id": steam_id, "property_tree": tree, "top_level_keys": list(gvas_file.properties.keys())})
+            except Exception as e:
+                return jsonify({"error": str(e)})
+    return jsonify({"error": "Player .sav not found"})
 
 
 @app.route("/api/refresh")
