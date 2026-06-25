@@ -10,12 +10,78 @@ app = Flask(__name__)
 CORS(app)
 
 # --- Config ---
-SAVE_DIR = os.environ.get("PALWORLD_SAVE_DIR") or "/var/lib/pelican/volumes/0ef8fccb-b40a-4843-b24d-35fdc0e52ba1/Pal/Saved/SaveGames"
-LIVE_DATA_DIR = os.environ.get("EZPAL_DATA_DIR") or "/var/lib/pelican/volumes/0ef8fccb-b40a-4843-b24d-35fdc0e52ba1/ezpal_live/"
 _CACHE_PATH = os.path.join(os.path.dirname(__file__), "paldata.json")
 _CACHE_REFRESH_INTERVAL = 60
 _cache = {"last_updated": None, "players": {}, "refreshing": False}
 _cache_lock = threading.Lock()
+
+
+def _discover_save_dir():
+    """Auto-discover the Palworld save directory. Tries env var first, then
+    running PalServer process, then common paths."""
+    env = os.environ.get("PALWORLD_SAVE_DIR")
+    if env:
+        return env
+
+    # Try to locate via running PalServer process
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ps", "-o", "args=", "-C", "PalServer-Linux-Shipping"],
+            capture_output=True, text=True, timeout=3
+        )
+        for line in result.stdout.strip().split("\n"):
+            line = line.strip()
+            # Extract binary path from command line
+            if "PalServer-Linux-Shipping" in line:
+                parts = line.split()
+                if parts:
+                    bin_path = parts[0]
+                    # Derive: .../Pal/Binaries/Linux/PalServer-Linux-Shipping
+                    # → .../Pal/Saved/SaveGames/
+                    pal_root = bin_path
+                    for _ in range(3):
+                        pal_root = os.path.dirname(pal_root)
+                    candidate = os.path.join(pal_root, "Saved", "SaveGames")
+                    if os.path.isdir(candidate):
+                        return candidate
+    except Exception:
+        pass
+
+    # Try common known paths
+    COMMON_PATHS = [
+        "/var/lib/pelican/volumes/0ef8fccb-b40a-4843-b24d-35fdc0e52ba1/Pal/Saved/SaveGames",
+        "/home/steam/Steam/steamapps/common/PalServer/Pal/Saved/SaveGames",
+        "/home/tcagame_svc2/dink/2/Pal/Saved/SaveGames",
+        "/palworld/Pal/Saved/SaveGames",
+        "/PalServer/Pal/Saved/SaveGames",
+    ]
+    for p in COMMON_PATHS:
+        if os.path.isdir(p):
+            return p
+
+    return "/var/lib/pelican/volumes/0ef8fccb-b40a-4843-b24d-35fdc0e52ba1/Pal/Saved/SaveGames"
+
+
+def _discover_live_dir():
+    """Find the mod JSON output directory. Env var first, then derive from save dir."""
+    env = os.environ.get("EZPAL_DATA_DIR")
+    if env:
+        return env
+    # Derive from SAVE_DIR: go up 3 levels, then ezpal_live/
+    save = _discover_save_dir()
+    for _ in range(3):
+        save = os.path.dirname(save)
+    candidate = os.path.join(save, "ezpal_live")
+    if os.path.isdir(candidate):
+        return candidate
+    return "/var/lib/pelican/volumes/0ef8fccb-b40a-4843-b24d-35fdc0e52ba1/ezpal_live/"
+
+
+SAVE_DIR = _discover_save_dir()
+LIVE_DATA_DIR = _discover_live_dir()
+print(f"SAVE_DIR={SAVE_DIR}", file=sys.stderr)
+print(f"LIVE_DATA_DIR={LIVE_DATA_DIR}", file=sys.stderr)
 
 # -- Optional palworld_save_tools --
 HAS_PAL_SAVE = False
