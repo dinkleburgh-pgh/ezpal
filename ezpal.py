@@ -173,34 +173,33 @@ def find_world_dirs():
     return dirs
 
 
+_PLM_DIAG = {}
+
 def read_sav_data(raw):
-    """Extract raw GVAS bytes from any Palworld save format (PlZ, PlM, CNK+PlZ, CNK+PlM)."""
-    offset = 0
+    """Extract GVAS bytes from save. Handles PlZ, CNK+PlZ, PlM with
+    offset probing for PlM. Returns (bytes, save_type)."""
     magic = raw[8:11]
 
-    # CNK prefix: a second 12-byte header wraps the real format
     if magic == b"CNK":
-        offset = 24
+        header = 24
         magic = raw[20:23]
+    elif magic in (b"PlZ", b"PlM"):
+        header = 12
     else:
-        offset = 12
-
-    if magic == b"PlZ":
-        # Compressed — let palworld_save_tools handle decompression
-        return decompress_sav_to_gvas(raw)
-
-    elif magic == b"PlM":
-        # Uncompressed — GVAS data starts at offset
-        gvas_bytes = raw[offset:]
-        # Some PlM saves have a secondary header at the start of GVAS data;
-        # try skipping a UE4 package header if present (sometimes another 4 bytes)
-        return gvas_bytes, 0
-
-    else:
-        # Maybe data already starts at 0 (raw GVAS with no container)
         if raw[:4] == b"GVAS":
             return raw, 0
-        raise Exception(f"Unknown save magic: {magic!r} at header offset 8-10")
+        raise Exception(f"Unknown save magic: {magic!r}")
+
+    if magic == b"PlZ":
+        return decompress_sav_to_gvas(raw)
+
+    # PlM: return bytes at a candidate offset; GvasFile.read is
+    # retried by the caller.  Log diagnostic info for debugging.
+    global _PLM_DIAG
+    _PLM_DIAG["header_size"] = header
+    _PLM_DIAG["file_size"] = len(raw)
+    _PLM_DIAG["first_32_hex"] = raw[0:32].hex()
+    return raw[header:], 0
 
 
 def scan_plm_pals(gvas_bytes):
@@ -904,6 +903,9 @@ def cache_status():
     with _cache_lock:
         player_count = len(_cache["players"])
         refreshing = _cache["refreshing"]
+    plm_info = {}
+    if _PLM_DIAG:
+        plm_info = {k: v for k, v in _PLM_DIAG.items()}
     return jsonify({
         "cached": age is not None,
         "cache_age_seconds": age,
@@ -912,6 +914,7 @@ def cache_status():
         "sav_available": HAS_PAL_SAVE,
         "live_data_dir": LIVE_DATA_DIR,
         "save_dir": SAVE_DIR,
+        "plm_diag": plm_info,
     })
 
 
